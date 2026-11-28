@@ -1212,14 +1212,17 @@ static void aic_send_invalid_data(struct aic_stream *s)
 }
 
 /*
- * The playback timer's interval: the period's own time, and never under AIC_TIMER_MIN_NS, so that no
- * hw_params can make it 0. (With a 0 ms timer the whole device stops.)
+ * The playback timer's interval: AIC_TICKS_A_PERIOD to a period, so that an underrun is seen and what
+ * has been played is cleared well within one, and never under AIC_TIMER_MIN_NS, so that no hw_params
+ * can make it 0. (With a 0 ms timer the whole device stops.)
  */
 /* aic_timer_ns: begin */
 #define AIC_TIMER_MIN_NS 1000000ULL
+#define AIC_TICKS_A_PERIOD 4
 static u64 aic_timer_ns(u32 period_frames, u32 rate)
 {
-	return max_t(u64, div_u64((u64)period_frames * NSEC_PER_SEC, rate), AIC_TIMER_MIN_NS);
+	return max_t(u64, div_u64(div_u64((u64)period_frames * NSEC_PER_SEC, rate), AIC_TICKS_A_PERIOD),
+		     AIC_TIMER_MIN_NS);
 }
 /* aic_timer_ns: end */
 
