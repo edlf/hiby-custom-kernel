@@ -1142,7 +1142,9 @@ static const struct snd_pcm_hardware aic_pcm_hardware = {
 	.period_bytes_min = 0x1000,
 	.period_bytes_max = AIC_PREALLOC_BYTES,
 	.periods_min = 4,
-	.periods_max = 0x200,
+	/* The DMA driver gives a channel one page of hardware descriptors, 32 bytes each, and a cyclic
+	 * transfer takes one a period: more than 128 periods cannot be prepared. */
+	.periods_max = PAGE_SIZE / 32,
 };
 
 static int aic_dma_pcm_open(struct snd_pcm_substream *substream)
