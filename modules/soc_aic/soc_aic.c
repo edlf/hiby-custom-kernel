@@ -10,7 +10,7 @@
 //   aic_select_clk                       2: playback and capture share the
 //                                        transmit clocks (symmetric rates)
 //   aic_if_send_invalid_data             1: the first playback hw_params
-//                                        plays a period of silence
+//                                        plays silence, a period or a page
 //   aic_if_send_invalid_data_everytime   1: every playback hw_params does
 //   aic_send_invalid_data_time_ms        how long that silence plays
 //
@@ -170,9 +170,9 @@ struct aic_stream {
 	u32 read_pos;
 	u32 copy_pos;
 	u32 avail;
-	u32 period_ns;
+	u64 period_ns;
 	u32 burst;
-	u32 period_frames;
+	u32 period_bytes;
 	u32 frame_bytes;
 	u32 channels;
 	u32 format;
@@ -500,7 +500,7 @@ static void aic_dma_submit_cyclic(struct aic_stream *s, enum dma_transfer_direct
 {
 	s->dma.buf = virt_to_phys(s->dma_area);
 	s->dma.len = s->buf_bytes;
-	s->dma.period = s->period_frames;
+	s->dma.period = s->period_bytes;
 	dma_param_submit_cyclic(&s->dma, dir);
 }
 
@@ -606,7 +606,7 @@ static int capture_dma_copy_thread(void *data)
 {
 	struct aic_stream *s = data;
 	u32 buf_bytes = s->dma_range;
-	u32 sleep_us = s->period_ns / 1000;
+	u32 sleep_us = div_u64(s->period_ns, 1000);
 	u32 chunk, left, copied, hw, delta, n, end, size;
 	dma_addr_t phys;
 	void *dst;
@@ -1178,33 +1178,49 @@ static int aic_dma_pcm_close(struct snd_pcm_substream *substream)
 	return 0;
 }
 
+/*
+ * The first-stream silence is a coherent allocation; it need not be a whole period, which may be
+ * large. One page.
+ */
+#define AIC_SILENCE_BYTES 4096
+
 // Plays aic_send_invalid_data_time_ms of silence, one period long, to
 // settle the line before the first playback.
 static void aic_send_invalid_data(struct aic_stream *s)
 {
-	void *mem = m_dma_alloc_coherent(s->period_frames);
+	u32 len = min_t(u32, s->period_bytes, AIC_SILENCE_BYTES);
+	void *mem = m_dma_alloc_coherent(len);
 
-	memset(mem, 0, s->period_frames);
-	dma_cache_sync(NULL, mem, s->period_frames, DMA_TO_DEVICE);
+	memset(mem, 0, len);
+	dma_cache_sync(NULL, mem, len, DMA_TO_DEVICE);
 	mutex_lock(&s->mutex);
 	mutex_lock(&aic_dev.mutex);
 	aic_hal_start_playback();
 	mutex_unlock(&aic_dev.mutex);
-	aic_dma_invalid_data_cyclic(&s->dma, DMA_MEM_TO_DEV, mem, s->period_frames);
+	aic_dma_invalid_data_cyclic(&s->dma, DMA_MEM_TO_DEV, mem, len);
 	mutex_unlock(&s->mutex);
 	usleep_range(aic_send_invalid_data_time_ms * 1000, aic_send_invalid_data_time_ms * 1000);
 	mutex_lock(&s->mutex);
 	aic_dma_terminate(s);
 	aic_stop_playback();
 	mutex_unlock(&s->mutex);
-	m_dma_free_coherent(mem, s->period_frames);
+	m_dma_free_coherent(mem, len);
 	if (!aic_if_send_invalid_data_everytime)
 		aic_if_send_invalid_data = 0;
 }
 
-// period_frames, the period size in frames, is also the DMA period in bytes;
-// the timer ticks every period_frames bytes' worth of audio, in whole
-// milliseconds.
+/*
+ * The playback timer's interval: the period's own time, and never under AIC_TIMER_MIN_NS, so that no
+ * hw_params can make it 0. (With a 0 ms timer the whole device stops.)
+ */
+/* aic_timer_ns: begin */
+#define AIC_TIMER_MIN_NS 1000000ULL
+static u64 aic_timer_ns(u32 period_frames, u32 rate)
+{
+	return max_t(u64, div_u64((u64)period_frames * NSEC_PER_SEC, rate), AIC_TIMER_MIN_NS);
+}
+/* aic_timer_ns: end */
+
 static int aic_dma_pcm_hw_params(struct snd_pcm_substream *substream,
 				 struct snd_pcm_hw_params *params)
 {
@@ -1213,7 +1229,7 @@ static int aic_dma_pcm_hw_params(struct snd_pcm_substream *substream,
 	u32 buffer_bytes = params_buffer_bytes(params);
 	int ret;
 
-	s->period_frames = params_period_size(params);
+	s->period_bytes = params_period_bytes(params);
 	if (s->format == SNDRV_PCM_FORMAT_S24_LE ||
 	    (s->format == SNDRV_PCM_FORMAT_S16_LE && playback && s->channels != 1)) {
 		s->dma.width = DMA_SLAVE_BUSWIDTH_4_BYTES;
@@ -1248,7 +1264,7 @@ static int aic_dma_pcm_hw_params(struct snd_pcm_substream *substream,
 		s->dma_area = m_dma_alloc_coherent(s->buf_bytes);
 	}
 
-	s->period_ns = s->period_frames * 1000 / aic_dev.rate / s->frame_bytes * 1000000;
+	s->period_ns = aic_timer_ns(params_period_size(params), aic_dev.rate);
 	s->dma_pos = 0;
 	s->read_pos = 0;
 	s->avail = 0;
