@@ -1261,6 +1261,10 @@ static int aic_dma_pcm_hw_params(struct snd_pcm_substream *substream,
 		if (aic_if_send_invalid_data)
 			aic_send_invalid_data(s);
 		s->dma_area = (void *)CKSEG0ADDR(substream->dma_buffer.area);
+		/* The same memory serves every stream. A DMA that runs past what has been written, until
+		 * the underrun is seen, must find silence there and not an earlier stream. */
+		memset(s->dma_area, 0, buffer_bytes);
+		dma_cache_sync(NULL, s->dma_area, buffer_bytes, DMA_TO_DEVICE);
 	} else {
 		s->area = (void *)CKSEG0ADDR(substream->dma_buffer.area);
 		s->dma_area = m_dma_alloc_coherent(s->buf_bytes);
